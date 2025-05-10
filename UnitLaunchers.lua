@@ -1,4 +1,4 @@
-                                                                                           --Meatballlunch Reloaded
+                                                                                           --V2 Meatballlunch Reloaded
 local UnitDefs, baseUnits = UnitDefs or {}, "armbotrail"
 local NewUnits = {
     armmeatball = {customparams = {i18n_en_humanname = "Meatball Launcher", i18n_en_tooltip = "Moege das Mett mit dir sein!"}, weapondefs = {arm_botrail = {range = 32000,metalpershot = 5300,energypershot = 96000,customparams = {stockpilelimit = 50,spawns_name = "armmeatball"}}}}
