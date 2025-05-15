@@ -1,0 +1,2 @@
+--Transportable Basebuilder 
+{armrespawn = {blocking = false,cantbetransported = false},legnanotcbase = {blocking = false,cantbetransported = false},correspawn = {blocking = false,cantbetransported = false}}
