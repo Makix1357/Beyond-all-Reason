@@ -1,0 +1,575 @@
+local widget = widget ---@type Widget
+
+function widget:GetInfo()
+	return {
+		name = "Construction Progress with Priority",
+		desc = "Shows building progress and priority for structures",
+		author = "Nervensaege",
+		date = "April 2025",
+		license = "GNU GPL, v2 or later",
+		layer = 0,
+		enabled = true,
+	}
+end
+
+-- Configuration
+local iconSize = 60
+local margin = 5
+local panelWidth = 300
+local panelHeight = 0
+local panelPosX = 0
+local panelPosY = 0
+local isDragging = false
+local startDragX, startDragY
+local startPanelX, startPanelY
+local titleHeight = 30
+local resizeDragging = false
+local minPanelWidth = 250
+local minIconSize = 50
+local maxIconSize = 100
+local resizeHandleSize = 10
+
+-- Priority constants
+local PRIORITY_LOW = 0
+local PRIORITY_MEDIUM = 1
+local PRIORITY_HIGH = 2
+local CMD_PRIORITY = 34571 -- From unit_builder_priority.lua
+
+-- Priority button colors
+local priorityColors = {
+	[PRIORITY_LOW] = { 1.0, 0.0, 0.0, 1.0 }, -- Red
+	[PRIORITY_MEDIUM] = { 1.0, 0.8, 0.0, 1.0 }, -- Yellow
+	[PRIORITY_HIGH] = { 0.0, 0.8, 0.0, 1.0 }, -- Green
+}
+
+-- Global variables
+local vsx, vsy
+local myTeamID
+local buildings = {}
+local backgroundPadding, elementCorner, RectRound, fuiElement, fui_ELEMENT_MARGIN
+local CMD_REPAIR = CMD.REPAIR
+
+-- Debug function
+local function Echo(msg)
+	Spring.Echo("[BuildProgress] " .. tostring(msg))
+end
+
+-- Save widget configuration
+local function SaveConfig()
+	local config = {
+		panelPosX = panelPosX,
+		panelPosY = panelPosY,
+		panelWidth = panelWidth,
+		iconSize = iconSize,
+	}
+	WG.SaveTable("BuildProgressPriority", config)
+	Echo("Configuration saved")
+end
+
+-- Load widget configuration
+local function LoadConfig()
+	local config = WG.LoadTable("BuildProgressPriority")
+	if config then
+		panelPosX = config.panelPosX or panelPosX
+		panelPosY = config.panelPosY or panelPosY
+		panelWidth = config.panelWidth or panelWidth
+		iconSize = config.iconSize or iconSize
+		Echo("Configuration loaded")
+	end
+end
+
+-- Widget initialization
+function widget:Initialize()
+	vsx, vsy = Spring.GetViewGeometry()
+	myTeamID = Spring.GetMyTeamID()
+
+	panelPosX = math.min(vsx - panelWidth - 100, vsx - panelWidth)
+	panelPosY = math.min(vsy * 0.5, vsy - panelHeight)
+
+	if WG.LoadTable then
+		LoadConfig()
+	end
+
+	if WG.FlowUI then
+		Echo("FlowUI found")
+		backgroundPadding = WG.FlowUI.elementPadding or 5
+		elementCorner = WG.FlowUI.elementCorner or 5
+		fuiElement = WG.FlowUI.Draw.Element
+		fui_ELEMENT_MARGIN = WG.FlowUI.elementMargin or 5
+		if WG.FlowUI.Draw and WG.FlowUI.Draw.RectRound then
+			RectRound = WG.FlowUI.Draw.RectRound
+			Echo("RectRound found")
+		else
+			Echo("RectRound not found, using fallback")
+			RectRound = function(x1, y1, x2, y2, radius, tl, tr, br, bl, c1, c2)
+				gl.Color(c1 or { 0.1, 0.1, 0.1, 0.8 })
+				gl.Rect(x1, y1, x2, y2)
+			end
+		end
+	else
+		Echo("FlowUI not found, using standard drawing functions")
+		backgroundPadding = 5
+		elementCorner = 5
+		fui_ELEMENT_MARGIN = 5
+		fuiElement = function(x1, y1, x2, y2, tl, tr, br, bl)
+			gl.Color(0.1, 0.1, 0.1, 0.8)
+			gl.Rect(x1, y1, x2, y2)
+		end
+		RectRound = function(x1, y1, x2, y2, radius, tl, tr, br, bl, c1, c2)
+			gl.Color(c1 or { 0.1, 0.1, 0.1, 0.8 })
+			gl.Rect(x1, y1, x2, y2)
+		end
+	end
+
+	Echo("Widget initialized")
+end
+
+-- Construction Turrets
+local ConTur = {}
+local MAX_DISTANCE = 0
+for unitDefID, defs in pairs(UnitDefs) do
+	if (string.find(defs.name:lower(), "nanotc") or string.find(defs.name:lower(), "respawn")) and not defs.canMove then
+		ConTur[unitDefID] = defs.buildDistance
+		if defs.buildDistance > MAX_DISTANCE then
+			MAX_DISTANCE = defs.buildDistance
+		end
+	end
+end
+
+-- Find nearby construction turrets
+local function findNearbyConTurrets(targetID)
+	local pos = { Spring.GetUnitPosition(targetID) }
+	if not pos or not pos[1] then
+		return {}
+	end
+
+	local myTeamID = Spring.GetMyTeamID()
+	local units_near = Spring.GetUnitsInCylinder(pos[1], pos[3], MAX_DISTANCE, myTeamID)
+	local nearby_MyConTur = {}
+
+	for _, id in ipairs(units_near) do
+		local unitDefID = Spring.GetUnitDefID(id)
+		local buildDistance = ConTur[unitDefID]
+		if buildDistance and targetID ~= id then
+			local separation = Spring.GetUnitSeparation(targetID, id, true)
+			if separation < buildDistance then
+				nearby_MyConTur[#nearby_MyConTur + 1] = {
+					id = id,
+					buildDistance = buildDistance,
+				}
+			end
+		end
+	end
+
+	return nearby_MyConTur
+end
+
+-- Update on screen size change
+function widget:ViewResize(newX, newY)
+	vsx, vsy = newX, newY
+	if panelPosX + panelWidth > vsx then
+		panelPosX = vsx - panelWidth
+	end
+	if panelPosY > vsy then
+		panelPosY = vsy
+	end
+end
+
+-- Update buildings under construction
+function widget:GameFrame(frameNum)
+	if frameNum % 15 ~= 0 then
+		return
+	end
+
+	local newBuildings = {}
+	local units = Spring.GetTeamUnits(myTeamID)
+	if not units then
+		return
+	end
+
+	for _, unitID in ipairs(units) do
+		local unitDefID = Spring.GetUnitDefID(unitID)
+		if unitDefID then
+			local ud = UnitDefs[unitDefID]
+			if ud.isBuilding then
+				local buildProgress = select(5, Spring.GetUnitHealth(unitID))
+				if buildProgress and buildProgress < 1.0 then
+					local builderID = Spring.GetUnitIsBuilding(unitID)
+					local builderIDs = builderID and { builderID } or {}
+					local nearbyTurrets = findNearbyConTurrets(unitID)
+					for _, turret in ipairs(nearbyTurrets) do
+						local cmdQueue = Spring.GetUnitCommands(turret.id, 1) or {}
+						local cmd = cmdQueue[1]
+						if
+							cmd
+							and type(cmd) == "table"
+							and cmd.id == CMD_REPAIR
+							and cmd.params
+							and cmd.params[1] == unitID
+						then
+							builderIDs[#builderIDs + 1] = turret.id
+						end
+					end
+
+					local px, py, pz = Spring.GetUnitPosition(unitID)
+					if px then
+						local sx, sy = Spring.WorldToScreenCoords(px, py, pz)
+						local priority = buildings[unitID] and buildings[unitID].priority or PRIORITY_LOW
+						local metalCost = ud.metalCost * (1 - buildProgress)
+						local energyCost = ud.energyCost * (1 - buildProgress)
+						local buildSpeed = 0
+						for _, builderID in ipairs(builderIDs) do
+							local builderDefID = Spring.GetUnitDefID(builderID)
+							if builderDefID then
+								local builderDef = UnitDefs[builderDefID]
+								buildSpeed = buildSpeed + (builderDef.buildSpeed or 0)
+							end
+						end
+
+						local timeLeft = 0
+						if buildSpeed > 0 then
+							timeLeft = ud.buildTime * (1 - buildProgress) / buildSpeed
+						end
+
+						local timeDisplay = ""
+						if timeLeft >= 3600 then
+							timeDisplay = string.format("%.1fh", timeLeft / 3600)
+						elseif timeLeft >= 60 then
+							timeDisplay = string.format("%.1fm", timeLeft / 60)
+						else
+							timeDisplay = string.format("%.1fs", timeLeft)
+						end
+
+						newBuildings[unitID] = {
+							unitDefID = unitDefID,
+							progress = buildProgress,
+							builders = builderIDs,
+							priority = priority,
+							position = { px, py, pz },
+							screenPos = { sx, sy },
+							metalLeft = metalCost,
+							energyLeft = energyCost,
+							timeLeft = timeLeft,
+							timeDisplay = timeDisplay,
+						}
+					end
+				end
+			end
+		end
+	end
+
+	buildings = newBuildings
+	local buildingCount = 0
+	for _ in pairs(buildings) do
+		buildingCount = buildingCount + 1
+	end
+
+	panelHeight = buildingCount * (iconSize + margin) + margin + titleHeight
+	if panelHeight < 50 + titleHeight then
+		panelHeight = 50 + titleHeight
+	end
+
+	if frameNum % 150 == 0 then
+		Echo("Current buildings under construction: " .. buildingCount)
+	end
+end
+
+-- Set priority for a building
+function setPriority(unitID, priority)
+	if not buildings[unitID] then
+		return
+	end
+
+	buildings[unitID].priority = priority
+	local builders = buildings[unitID].builders or {}
+	for _, builderID in ipairs(builders) do
+		if priority == PRIORITY_LOW then
+			Spring.GiveOrderToUnit(builderID, CMD_PRIORITY, { 0 }, 0)
+		elseif priority == PRIORITY_MEDIUM then
+			if _ <= #builders / 2 then
+				Spring.GiveOrderToUnit(builderID, CMD_PRIORITY, { 1 }, 0)
+			else
+				Spring.GiveOrderToUnit(builderID, CMD_PRIORITY, { 0 }, 0)
+			end
+		else
+			Spring.GiveOrderToUnit(builderID, CMD_PRIORITY, { 1 }, 0)
+		end
+	end
+
+	local nearbyTurrets = findNearbyConTurrets(unitID)
+	for _, turret in ipairs(nearbyTurrets) do
+		local isBuilder = false
+		for _, builderID in ipairs(builders) do
+			if builderID == turret.id then
+				isBuilder = true
+				break
+			end
+		end
+		if not isBuilder then
+			local cmdQueue = Spring.GetUnitCommands(turret.id, 1) or {}
+			local cmd = cmdQueue[1]
+			if not cmd or (type(cmd) == "table" and cmd.id == CMD.FIGHT) then
+				Spring.GiveOrderToUnit(turret.id, CMD_REPAIR, { unitID }, 0)
+				if priority == PRIORITY_LOW then
+					Spring.GiveOrderToUnit(turret.id, CMD_PRIORITY, { 0 }, 0)
+				elseif priority == PRIORITY_MEDIUM then
+					if _ <= #nearbyTurrets / 2 then
+						Spring.GiveOrderToUnit(turret.id, CMD_PRIORITY, { 1 }, 0)
+					else
+						Spring.GiveOrderToUnit(turret.id, CMD_PRIORITY, { 0 }, 0)
+					end
+				else
+					Spring.GiveOrderToUnit(turret.id, CMD_PRIORITY, { 1 }, 0)
+				end
+			end
+		end
+	end
+
+	if WG.builderpriority and WG.builderpriority.getLowPriorityNanos() and priority > PRIORITY_LOW then
+		Echo("Warning: Overriding global low priority for nanos")
+	end
+
+	Echo("Priority for building " .. unitID .. " set to " .. priority)
+end
+
+-- Draw the UI
+function widget:DrawScreen()
+	if Spring.IsGUIHidden() then
+		return
+	end
+
+	gl.PushMatrix()
+
+	-- Panel background
+	fuiElement(
+		panelPosX - fui_ELEMENT_MARGIN,
+		panelPosY - panelHeight - fui_ELEMENT_MARGIN,
+		panelPosX + panelWidth + fui_ELEMENT_MARGIN,
+		panelPosY + fui_ELEMENT_MARGIN,
+		1,
+		1,
+		1,
+		1
+	)
+
+	-- Title bar
+	fuiElement(
+		panelPosX - fui_ELEMENT_MARGIN,
+		panelPosY - titleHeight,
+		panelPosX + panelWidth + fui_ELEMENT_MARGIN,
+		panelPosY + fui_ELEMENT_MARGIN,
+		1,
+		1,
+		1,
+		1
+	)
+
+	-- Title
+	gl.Color(1, 1, 1, 1)
+	gl.Text("Construction Progress", panelPosX + 10, panelPosY - titleHeight / 2 - 7, 16)
+
+	-- Resize handle
+	gl.Color(0.8, 0.8, 0.8, 0.8)
+	gl.Rect(
+		panelPosX + panelWidth - resizeHandleSize,
+		panelPosY - panelHeight,
+		panelPosX + panelWidth,
+		panelPosY - panelHeight + resizeHandleSize
+	)
+
+	-- Draw buildings
+	local yPos = panelPosY - titleHeight - margin - iconSize
+	for unitID, data in pairs(buildings) do
+		local unitDefID = data.unitDefID
+		local progress = data.progress
+		local priority = data.priority
+		local ud = UnitDefs[unitDefID]
+		if ud then
+			local iconTexture = "#" .. unitDefID
+			gl.Texture(iconTexture)
+			gl.Color(1, 1, 1, 1)
+			gl.TexRect(panelPosX + margin, yPos, panelPosX + margin + iconSize, yPos + iconSize)
+			gl.Texture(false)
+		end
+
+		-- Priority buttons (H top, L bottom)
+		local buttonWidth = 2 * (iconSize / 3 - 2) -- 3x wider
+		local buttonHeight = 1.5 * (iconSize / 2 - 2) -- 2x higher
+		local buttonX = panelPosX + margin * 2 + iconSize
+		local totalButtonHeight = 3 * (buttonHeight + 2) -- Total height for all buttons
+		local startY = yPos + (iconSize - totalButtonHeight) / 2 -- Center vertically
+
+		for i = 2, 0, -1 do -- H (2) top, L (0) bottom
+			local buttonY = startY + (2 - i) * (buttonHeight + 2)
+			if priority == i then
+				gl.Color(priorityColors[i][1], priorityColors[i][2], priorityColors[i][3], 1.0)
+			else
+				gl.Color(priorityColors[i][1] * 0.5, priorityColors[i][2] * 0.5, priorityColors[i][3] * 0.5, 0.7)
+			end
+			if RectRound then
+				RectRound(
+					buttonX,
+					buttonY,
+					buttonX + buttonWidth,
+					buttonY + buttonHeight,
+					elementCorner / 2,
+					1,
+					1,
+					1,
+					1
+				)
+			else
+				gl.Rect(buttonX, buttonY, buttonX + buttonWidth, buttonY + buttonHeight)
+			end
+			gl.Color(1, 1, 1, 1)
+			local text = i == PRIORITY_LOW and "L" or i == PRIORITY_MEDIUM and "M" or "H"
+			gl.Text(text, buttonX + buttonWidth / 2, buttonY + buttonHeight / 2 - 6, 12, "cn")
+		end
+
+		-- Progress bar
+		local barWidth = panelWidth - buttonWidth - iconSize - margin * 5
+		local barX = panelPosX + margin * 3 + iconSize + buttonWidth
+		local barY = yPos + iconSize / 2 - iconSize / 6
+		local barHeight = iconSize / 3
+
+		gl.Color(0.2, 0.2, 0.2, 0.8)
+		if RectRound then
+			RectRound(barX, barY, barX + barWidth, barY + barHeight, elementCorner / 2, 1, 1, 1, 1)
+		else
+			gl.Rect(barX, barY, barX + barWidth, barY + barHeight)
+		end
+
+		gl.Color(0.0, 0.7, 0.0, 0.8)
+		if RectRound then
+			RectRound(barX, barY, barX + barWidth * progress, barY + barHeight, elementCorner / 2, 1, 1, 1, 1)
+		else
+			gl.Rect(barX, barY, barX + barWidth * progress, barY + barHeight)
+		end
+
+		gl.Color(1, 1, 1, 1)
+		local progressText = math.floor(progress * 100) .. "%"
+		gl.Text(progressText, barX + barWidth / 2, barY + 3, 12, "cn")
+
+		local infoY = barY + barHeight + 2
+		local metalText = string.format("M: %.0f", data.metalLeft)
+		local energyText = string.format("E: %.0f", data.energyLeft)
+		local timeText = string.format("ETA: %s", data.timeDisplay)
+
+		gl.Color(0.8, 0.8, 0.8, 1)
+		gl.Text(metalText, barX + 5, infoY, 10, "o")
+		gl.Text(energyText, barX + barWidth / 3, infoY, 10, "o")
+		gl.Text(timeText, barX + barWidth * 2 / 3, infoY, 10, "o")
+
+		yPos = yPos - iconSize - margin
+	end
+
+	gl.PopMatrix()
+end
+
+-- Check if mouse is over resize handle
+local function IsOverResizeHandle(x, y)
+	local resizeX = panelPosX + panelWidth - resizeHandleSize
+	local resizeY = panelPosY - panelHeight
+	return x >= resizeX and x <= panelPosX + panelWidth and y >= resizeY and y <= resizeY + resizeHandleSize
+end
+
+-- Mouse press handling
+function widget:MousePress(x, y, button)
+	if Spring.IsGUIHidden() then
+		return false
+	end
+
+	if IsOverResizeHandle(x, y) then
+		resizeDragging = true
+		return true
+	end
+
+	if
+		x >= panelPosX - fui_ELEMENT_MARGIN
+		and x <= panelPosX + panelWidth + fui_ELEMENT_MARGIN
+		and y >= panelPosY - titleHeight
+		and y <= panelPosY + fui_ELEMENT_MARGIN
+	then
+		isDragging = true
+		startDragX, startDragY = x, y
+		startPanelX, startPanelY = panelPosX, panelPosY
+		return true
+	end
+
+	if x < panelPosX or x > panelPosX + panelWidth or y < panelPosY - panelHeight or y > panelPosY then
+		return false
+	end
+
+	local yPos = panelPosY - titleHeight - margin - iconSize
+	for unitID, data in pairs(buildings) do
+		local buttonWidth = 3 * (iconSize / 3 - 2)
+		local buttonHeight = 2 * (iconSize / 3 - 2)
+		local buttonX = panelPosX + margin * 2 + iconSize
+		local totalButtonHeight = 3 * (buttonHeight + 2)
+		local startY = yPos + (iconSize - totalButtonHeight) / 2
+
+		for i = 2, 0, -1 do
+			local buttonY = startY + (2 - i) * (buttonHeight + 2)
+			if x >= buttonX and x <= buttonX + buttonWidth and y >= buttonY and y <= buttonY + buttonHeight then
+				setPriority(unitID, i)
+				return true
+			end
+		end
+		yPos = yPos - iconSize - margin
+	end
+
+	return false
+end
+
+-- Mouse move handling
+function widget:MouseMove(x, y, dx, dy, button)
+	if isDragging then
+		panelPosX = startPanelX + (x - startDragX)
+		panelPosY = startPanelY + (y - startDragY)
+		if panelPosX < 0 then
+			panelPosX = 0
+		end
+		if panelPosX + panelWidth > vsx then
+			panelPosX = vsx - panelWidth
+		end
+		if panelPosY < panelHeight then
+			panelPosY = panelHeight
+		end
+		if panelPosY > vsy then
+			panelPosY = vsy
+		end
+		return true
+	elseif resizeDragging then
+		local newWidth = panelWidth - dx
+		local newIconSize = iconSize - dx * 0.13
+		if newWidth >= minPanelWidth then
+			panelWidth = newWidth
+		end
+		if newIconSize >= minIconSize and newIconSize <= maxIconSize then
+			iconSize = newIconSize
+		end
+		return true
+	end
+	return false
+end
+
+-- Mouse release handling
+function widget:MouseRelease(x, y, button)
+	if isDragging or resizeDragging then
+		isDragging = false
+		resizeDragging = false
+		if WG.SaveTable then
+			SaveConfig()
+		end
+		return true
+	end
+	return false
+end
+
+-- Widget shutdown
+function widget:Shutdown()
+	if WG.SaveTable then
+		SaveConfig()
+	end
+	Echo("Widget terminated")
+end
