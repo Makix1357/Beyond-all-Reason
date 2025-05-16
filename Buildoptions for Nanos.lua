@@ -26,15 +26,13 @@ for _, faction in ipairs(Factions) do
 			for i, option in ipairs(baseBuildOptions) do
 				UnitDefs[unit].buildoptions[i] = option
 			end
-			table.insert(UnitDefs[unit].buildoptions, faction .. 'ap')
-			table.insert(UnitDefs[unit].buildoptions, faction .. 'vp')
 		end
 	end
 end
 
 --T2 Buildoptions
 for _, faction in ipairs(Factions) do
-	local short = { faction .. 'apt3', faction .. 'afust3', faction .. 'gatet3', faction .. 'nanotct2', faction .. 'wint2', faction .. 'ap', faction .. 'vp' }
+	local short = { faction .. 'apt3', faction .. 'afust3', faction .. 'gatet3', faction .. 'nanotct2', faction .. 'wint2', faction .. 'aap', faction .. 'avp' }
 	local additionalBuildOptions = {}
 	if faction == 'arm' then
 		additionalBuildOptions = { 'armminivulc', 'armbotrail', 'armannit3', 'armmmkrt3', 'armshockwave', 'armlwall' }
